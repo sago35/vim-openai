@@ -3,7 +3,7 @@ if !exists('g:llm_host')
   let g:llm_host = 'http://localhost:11434'
 endif
 if !exists('g:llm_model')
-  let g:llm_model = 'Gemma-4-E4B-it-GGUF'
+  let g:llm_model = 'gemma-4-E4B-it-qat-GGUF-UD-Q4_K_XL'
 endif
 if !exists('g:llm_system')
   let g:llm_system = 'You are a helpful assistant. Answer concisely.'
