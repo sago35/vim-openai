@@ -14,6 +14,9 @@ endif
 if !exists('g:llm_result_bufname')
   let g:llm_result_bufname = '__LLM_RESULT__'
 endif
+if !exists('g:llm_auth_token')
+  let g:llm_auth_token = ''
+endif
 
 let s:running_jobs = {}
 let s:req_seq = 0
@@ -78,8 +81,8 @@ function! s:OnCurlExit(ctx, job, status) abort
     let body = join(readfile(a:ctx.resp, 'b'), "\n")
   endif
 
-  if has_key(a:ctx, 'tmp') && filereadable(a:ctx.tmp)
-    call delete(a:ctx.tmp)
+  if has_key(a:ctx, 'tmp_req') && filereadable(a:ctx.tmp_req)
+    call delete(a:ctx.tmp_req)
   endif
   if has_key(a:ctx, 'resp') && filereadable(a:ctx.resp)
     call delete(a:ctx.resp)
@@ -140,13 +143,20 @@ function! s:CallOpenAIChatAsync(userText, on_done) abort
   call writefile([json], tmp_req, 'b')
 
   let tmp_resp = tempname()
-  let cmd = [
-        \ 'curl', '-sS', '--fail',
+
+  let cmd = ['curl', '-sS', '--fail']
+
+  " トークンが設定されている場合のみ Authorization ヘッダーを追加
+  if !empty(g:llm_auth_token)
+    call extend(cmd, ['-H', 'Authorization: Bearer ' . g:llm_auth_token])
+  endif
+
+  call extend(cmd, [
         \ '-H', 'Content-Type: application/json',
         \ url,
         \ '--data-binary', '@' . tmp_req,
         \ '--output', tmp_resp,
-        \ ]
+        \ ])
 
   let ctx = {'stdout': [], 'stderr': [], 'tmp_req': tmp_req, 'resp': tmp_resp, 'on_done': a:on_done}
 
