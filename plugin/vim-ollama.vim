@@ -216,6 +216,10 @@ function! s:RenderResultWithInput(title, input, output_text) abort
   let out = substitute(a:output_text, "\r\n", "\n", 'g')
   let out = substitute(out, "\r", "\n", 'g')
 
+  " --- 修正: </think> の直後に文字がある場合、改行を挿入して分離する ---
+  " \ze を使って </think> の後ろに何らかの文字（空行以外）がある場合のみマッチさせます
+  let out = substitute(out, '\(<\/think>\)\ze.', "\\1\n", 'g')
+
   let in_lines  = split(inp, "\n", 1)
   let out_lines = split(out, "\n", 1)
 
@@ -239,6 +243,7 @@ function! s:RenderResultWithInput(title, input, output_text) abort
   call setbufvar(bn, '&modifiable', 0)
 
   call s:ApplyInputFold(bn)
+  call s:ApplyThinkFold(bn)
 
   let wnr = bufwinnr(bn)
   if wnr != -1
@@ -268,7 +273,7 @@ function! s:ApplyInputFold(bn) abort
     return
   endif
 
-  let start = lnum + 1
+  let start = lnum
   let end = 0
   let out_lnum = 0
   for i in range(lnum, len(all))
@@ -282,9 +287,31 @@ function! s:ApplyInputFold(bn) abort
     return
   endif
 
-  let start = lnum
   call win_execute(wnr, printf('silent! %d,%dfold', start, end))
   call win_execute(wnr, printf('silent! %dnormal! zC', lnum))
+endfunction
+
+function! s:ApplyThinkFold(bn) abort
+  let wnr = bufwinid(a:bn)
+  if wnr == -1
+    return
+  endif
+
+  let all = getbufline(a:bn, 1, '$')
+  let think_start = 0
+
+  for i in range(0, len(all)-1)
+    if all[i] =~# '<think>'
+      let think_start = i + 1
+    elseif all[i] =~# '</think>' && think_start > 0
+      let think_end = i + 1
+      if think_end > think_start
+        call win_execute(wnr, printf('silent! %d,%dfold', think_start, think_end))
+        call win_execute(wnr, printf('silent! %dnormal! zC', think_start))
+      endif
+      let think_start = 0
+    endif
+  endfor
 endfunction
 
 augroup llm_result_pane
@@ -306,6 +333,7 @@ endfunction
 function! s:MaybeApplyPendingFold() abort
   if &l:buftype ==# 'nofile' && bufname('%') ==# g:llm_result_bufname
     call s:ApplyInputFold(bufnr('%'))
+    call s:ApplyThinkFold(bufnr('%'))
     call setbufvar(bufnr('%'), 'llm_pending_fold', 0)
   endif
 endfunction
