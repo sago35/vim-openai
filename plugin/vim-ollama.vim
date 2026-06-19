@@ -99,10 +99,54 @@ function! s:OnCurlExit(ctx, job, status) abort
   endif
 
   try
-    let res = json_decode(body)
+      let res = json_decode(body)
   catch
-    call s:DeferCall(a:ctx.on_done, [v:false, "Invalid JSON response:\n" . body])
-    return
+      let full_content = ''
+      let last_chunk = {}
+
+      let lines = split(body, "\n")
+      for line in lines
+          if line !~# '^data:\s*'
+              continue
+          endif
+
+          let json_str = substitute(line, '^data:\s*', '', '')
+
+          if json_str ==# '[DONE]'
+              break
+          endif
+
+          try
+              let chunk = json_decode(json_str)
+              let last_chunk = chunk
+
+              " choices[0].delta.content
+              if has_key(chunk, 'choices') && len(chunk.choices) > 0 && has_key(chunk.choices[0], 'delta')
+                  let delta = chunk.choices[0].delta
+                  if has_key(delta, 'content')
+                      let full_content .= delta.content
+                  endif
+              endif
+
+          catch
+              call s:DeferCall(a:ctx.on_done, [v:false, "Invalid JSON response:\n" . line])
+              return
+          endtry
+      endfor
+
+      let res = {
+                  \   'choices': [{
+                  \     'message': {
+                  \       'role': 'assistant',
+                  \       'content': full_content
+                  \     }
+                  \   }]
+                  \ }
+
+      if !empty(last_chunk)
+          let res.id = get(last_chunk, 'id', '')
+          let res.model = get(last_chunk, 'model', '')
+      endif
   endtry
 
   if type(res) == v:t_dict
