@@ -17,6 +17,9 @@ endif
 if !exists('g:llm_auth_token')
   let g:llm_auth_token = ''
 endif
+if !exists('g:llm_additional_prompt')
+  let g:llm_additional_prompt = ''
+endif
 
 let s:running_jobs = {}
 let s:req_seq = 0
@@ -425,6 +428,10 @@ function! LLMAskFromVisual(...) range abort
           \ . "=== SELECTION END ===\n\n"
           \ . "Question: " . q . "\n"
           \ . "Answer based on the selection (if insufficient, say so)."
+
+    if exists('g:llm_additional_prompt') && !empty(g:llm_additional_prompt)
+      let prompt .= "\n\n" . g:llm_additional_prompt
+    endif
 
     let title = 'LLM Q&A (' . g:llm_model . ')'
 
