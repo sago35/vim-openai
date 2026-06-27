@@ -465,5 +465,58 @@ function! s:LogToFile(line) abort
   call writefile([strftime('%Y-%m-%d %H:%M:%S ') . a:line], expand('~/vim_llm.log'), 'a')
 endfunction
 
+function! s:FetchModelNames() abort
+  let cmd = ['curl', '-sS', '--max-time', '5']
+  if !empty(g:llm_auth_token)
+    call extend(cmd, ['-H', 'Authorization: Bearer ' . g:llm_auth_token])
+  endif
+  call add(cmd, g:llm_host . g:llm_openai_prefix . '/models')
+
+  let out = system(cmd)
+  if v:shell_error != 0
+    echohl ErrorMsg | echom 'LLM: /v1/models fetch failed' | echohl None
+    return []
+  endif
+
+  try
+    let res = json_decode(out)
+  catch
+    echohl ErrorMsg | echom 'LLM: JSON parse failed' | echohl None
+    return []
+  endtry
+
+  if type(res) != v:t_dict || !has_key(res, 'data')
+    return []
+  endif
+  return map(copy(res.data), {_, m -> m.id})
+endfunction
+
+function! LLMSelectModel() abort
+  let names = s:FetchModelNames()
+  if empty(names)
+    echohl WarningMsg | echom 'LLM: No models found' | echohl None
+    return
+  endif
+
+  let items = ['Select LLM model (0 to cancel):']
+  let i = 1
+  for name in names
+    let mark = (name ==# g:llm_model) ? ' [current]' : ''
+    call add(items, printf('%2d. %s%s', i, name, mark))
+    let i += 1
+  endfor
+
+  let choice = inputlist(items)
+  if choice < 1 || choice > len(names)
+    echom 'LLM: Canceled'
+    return
+  endif
+
+  let g:llm_model = names[choice - 1]
+  echom 'LLM: model -> ' . g:llm_model
+endfunction
+
+command! LLMSelectModel call LLMSelectModel()
+
 xnoremap <silent> <leader>q :<C-u>call LLMAskFromVisual()<CR>
 xnoremap <silent> <leader>o :<C-u>call LLMFromVisual()<CR>
