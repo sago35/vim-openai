@@ -24,6 +24,13 @@ endif
 let s:running_jobs = {}
 let s:req_seq = 0
 
+" Conversation state for follow-up questions
+let s:llm_conv_title      = ''
+let s:llm_conv_pane_input = ''
+let s:llm_conv_pane_out   = ''
+let s:llm_conv_follow_ups = []   " [{q: '...', a: '...'}]
+let s:llm_conv_api_msgs   = []   " full messages array for API context
+
 " Returns the visual selection as a string.
 function! s:GetVisualSelection() abort
   let [l1, c1] = getpos("'<")[1:2]
@@ -148,19 +155,13 @@ function! s:DeferCall(Fn, args) abort
   call timer_start(0, {-> call(a:Fn, a:args)})
 endfunction
 
-" Asynchronously calls the OpenAI Chat API endpoint. It constructs the request
-" payload using predefined global variables (model, system prompt), writes it
-" to a temporary file, executes 'curl' to send the request, and manages the
-" execution job. It notifies the provided callback function upon completion."
-function! s:CallOpenAIChatAsync(userText, on_done, ...) abort
+" Core async function: accepts a full messages array and sends to the API.
+function! s:CallOpenAIChatAsyncMsgs(messages, on_done, ...) abort
   let On_chunk = a:0 >= 1 ? a:1 : v:null
 
   let payload = {
         \ 'model': g:llm_model,
-        \ 'messages': [
-        \   {'role': 'system', 'content': g:llm_system},
-        \   {'role': 'user', 'content': a:userText},
-        \ ],
+        \ 'messages': a:messages,
         \ 'stream': v:true
         \ }
 
@@ -211,6 +212,16 @@ function! s:CallOpenAIChatAsync(userText, on_done, ...) abort
   return job
 endfunction
 
+" Convenience wrapper: single user message with system prompt.
+function! s:CallOpenAIChatAsync(userText, on_done, ...) abort
+  let On_chunk = a:0 >= 1 ? a:1 : v:null
+  let messages = [
+        \ {'role': 'system', 'content': g:llm_system},
+        \ {'role': 'user',   'content': a:userText},
+        \ ]
+  return s:CallOpenAIChatAsyncMsgs(messages, a:on_done, On_chunk)
+endfunction
+
 function! s:EnsureResultPane() abort
   let bn = bufnr(g:llm_result_bufname)
 
@@ -238,47 +249,100 @@ function! s:EnsureResultPane() abort
   return bn
 endfunction
 
-function! s:RenderResultWithInput(title, input, output_text) abort
-  let bn = s:EnsureResultPane()
-
+" Build display lines from the current conversation state.
+" a:mode: 'stream' (no folds) or 'final' (apply folds)
+function! s:BuildConvLines(input, output_text, follow_ups) abort
   let inp = substitute(a:input, "\r\n", "\n", 'g')
   let inp = substitute(inp, "\r", "\n", 'g')
   let out = substitute(a:output_text, "\r\n", "\n", 'g')
   let out = substitute(out, "\r", "\n", 'g')
-
-  " --- 修正: </think> の直後に文字がある場合、改行を挿入して分離する ---
-  " \ze を使って </think> の後ろに何らかの文字（空行以外）がある場合のみマッチさせます
   let out = substitute(out, '\(<\/think>\)\ze.', "\\1\n", 'g')
 
-  let in_lines  = split(inp, "\n", 1)
-  let out_lines = split(out, "\n", 1)
-
   let lines =
-        \ ['# ' . a:title,
+        \ ['# ' . s:llm_conv_title,
         \  '',
         \  '## Input (folded)',
-        \  ''] + in_lines +
+        \  ''] + split(inp, "\n", 1) +
         \ ['',
         \  '## Output',
-        \  ''] + out_lines
+        \  ''] + split(out, "\n", 1)
 
-  call setbufvar(bn, '&modifiable', 1)
-  call setbufline(bn, 1, lines)
+  let n = 1
+  for fu in a:follow_ups
+    let fu_q = substitute(fu.q, "\r\n", "\n", 'g')
+    let fu_q = substitute(fu_q, "\r", "\n", 'g')
+    let fu_a = substitute(fu.a, "\r\n", "\n", 'g')
+    let fu_a = substitute(fu_a, "\r", "\n", 'g')
+    let fu_a = substitute(fu_a, '\(<\/think>\)\ze.', "\\1\n", 'g')
+    let lines += ['', '## Follow-up ' . n, '']
+          \ + split(fu_q, "\n", 1)
+          \ + ['', '## Answer ' . n, '']
+          \ + split(fu_a, "\n", 1)
+    let n += 1
+  endfor
 
-  let new_last = len(lines)
-  let old_last = len(getbufline(bn, 1, '$'))
+  return lines
+endfunction
+
+function! s:WriteLinesToResultBuf(bn, lines) abort
+  call setbufvar(a:bn, '&modifiable', 1)
+  call setbufline(a:bn, 1, a:lines)
+  let new_last = len(a:lines)
+  let old_last = len(getbufline(a:bn, 1, '$'))
   if old_last > new_last
-    call deletebufline(bn, new_last + 1, '$')
+    call deletebufline(a:bn, new_last + 1, '$')
   endif
-  call setbufvar(bn, '&modifiable', 0)
+  call setbufvar(a:bn, '&modifiable', 0)
+endfunction
+
+" Render result pane with folds applied (final state).
+function! s:RenderResultWithInput(title, input, output_text, ...) abort
+  let follow_ups = a:0 >= 1 ? a:1 : []
+  let bn = s:EnsureResultPane()
+
+  let lines = s:BuildConvLines(a:input, a:output_text, follow_ups)
+  call s:WriteLinesToResultBuf(bn, lines)
 
   call s:ApplyInputFold(bn)
   call s:ApplyThinkFold(bn)
 
+  let winid = bufwinid(bn)
+  if winid != -1
+    call win_execute(winid, 'normal! G')
+  endif
+endfunction
+
+" Render result pane during streaming (no folds, scroll to bottom).
+function! s:RenderStreamChunk(title, input, output_text, ...) abort
+  let follow_ups = a:0 >= 1 ? a:1 : []
+  let bn = bufnr(g:llm_result_bufname)
+  if bn == -1
+    return
+  endif
+
+  let lines = s:BuildConvLines(a:input, a:output_text, follow_ups)
+  call s:WriteLinesToResultBuf(bn, lines)
+
   let wnr = bufwinnr(bn)
   if wnr != -1
-    call win_execute(wnr, 'normal! gg')
+    call win_execute(wnr, 'normal! G')
   endif
+endfunction
+
+" Move the result pane so that "## Follow-up N" is at the top of the window.
+function! s:ScrollToFollowUp(bn, n) abort
+  let winid = bufwinid(a:bn)
+  if winid == -1
+    return
+  endif
+  let target = '## Follow-up ' . a:n
+  let all = getbufline(a:bn, 1, '$')
+  for i in range(0, len(all) - 1)
+    if all[i] ==# target
+      call win_execute(winid, printf('call cursor(%d, 1) | normal! zt', i + 1))
+      return
+    endif
+  endfor
 endfunction
 
 function! s:ApplyInputFold(bn) abort
@@ -288,6 +352,8 @@ function! s:ApplyInputFold(bn) abort
     return
   endif
 
+  " zE and zC move the cursor; save/restore so callers control final position
+  call win_execute(wnr, 'let s:_fold_view = winsaveview()')
   call win_execute(wnr, 'setlocal foldmethod=manual')
   call win_execute(wnr, 'silent! normal! zE')
 
@@ -319,6 +385,7 @@ function! s:ApplyInputFold(bn) abort
 
   call win_execute(wnr, printf('silent! %d,%dfold', start, end))
   call win_execute(wnr, printf('silent! %dnormal! zC', lnum))
+  call win_execute(wnr, 'call winrestview(s:_fold_view)')
 endfunction
 
 function! s:ApplyThinkFold(bn) abort
@@ -326,6 +393,8 @@ function! s:ApplyThinkFold(bn) abort
   if wnr == -1
     return
   endif
+
+  call win_execute(wnr, 'let s:_think_fold_view = winsaveview()')
 
   let all = getbufline(a:bn, 1, '$')
   let think_start = 0
@@ -342,6 +411,8 @@ function! s:ApplyThinkFold(bn) abort
       let think_start = 0
     endif
   endfor
+
+  call win_execute(wnr, 'call winrestview(s:_think_fold_view)')
 endfunction
 
 augroup llm_result_pane
@@ -361,10 +432,12 @@ function! s:ForceResultWinOptions() abort
 endfunction
 
 function! s:MaybeApplyPendingFold() abort
+  let bn = bufnr('%')
   if &l:buftype ==# 'nofile' && bufname('%') ==# g:llm_result_bufname
-    call s:ApplyInputFold(bufnr('%'))
-    call s:ApplyThinkFold(bufnr('%'))
-    call setbufvar(bufnr('%'), 'llm_pending_fold', 0)
+        \ && getbufvar(bn, 'llm_pending_fold', 0)
+    call s:ApplyInputFold(bn)
+    call s:ApplyThinkFold(bn)
+    call setbufvar(bn, 'llm_pending_fold', 0)
   endif
 endfunction
 
@@ -425,54 +498,32 @@ function! LLMAskFromVisual(...) range abort
   endtry
 endfunction
 
-function! s:RenderStreamChunk(title, input, output_text) abort
-  let bn = bufnr(g:llm_result_bufname)
-  if bn == -1
-    return
-  endif
-
-  let inp = substitute(a:input, "\r\n", "\n", 'g')
-  let inp = substitute(inp, "\r", "\n", 'g')
-  let out = substitute(a:output_text, "\r\n", "\n", 'g')
-  let out = substitute(out, "\r", "\n", 'g')
-
-  let in_lines  = split(inp, "\n", 1)
-  let out_lines = split(out, "\n", 1)
-
-  let lines =
-        \ ['# ' . a:title,
-        \  '',
-        \  '## Input (folded)',
-        \  ''] + in_lines +
-        \ ['',
-        \  '## Output',
-        \  ''] + out_lines
-
-  call setbufvar(bn, '&modifiable', 1)
-  call setbufline(bn, 1, lines)
-
-  let new_last = len(lines)
-  let old_last = len(getbufline(bn, 1, '$'))
-  if old_last > new_last
-    call deletebufline(bn, new_last + 1, '$')
-  endif
-  call setbufvar(bn, '&modifiable', 0)
-endfunction
-
 function! s:OnLLMChunkWrapper(title, prompt, text) abort
-  call s:RenderStreamChunk(a:title, a:prompt, a:text)
+  call s:RenderStreamChunk(a:title, a:prompt, a:text, s:llm_conv_follow_ups)
 endfunction
 
 function! s:OnLLMDoneWrapper(title, prompt, ok, text) abort
   if a:ok
-    call s:RenderResultWithInput(a:title, a:prompt, a:text)
+    let s:llm_conv_pane_out = a:text
+    call add(s:llm_conv_api_msgs, {'role': 'assistant', 'content': a:text})
+    call s:RenderResultWithInput(a:title, a:prompt, a:text, s:llm_conv_follow_ups)
   else
-    call s:RenderResultWithInput(a:title, a:prompt, "ERROR\n\n" . a:text)
+    call s:RenderResultWithInput(a:title, a:prompt, "ERROR\n\n" . a:text, s:llm_conv_follow_ups)
   endif
 endfunction
 
 function! s:RunLLMRequest(title, prompt) abort
-  call s:RenderResultWithInput(a:title, a:prompt, "Thinking...")
+  " Initialize conversation state for a new request
+  let s:llm_conv_title      = a:title
+  let s:llm_conv_pane_input = a:prompt
+  let s:llm_conv_pane_out   = ''
+  let s:llm_conv_follow_ups = []
+  let s:llm_conv_api_msgs   = [
+        \ {'role': 'system', 'content': g:llm_system},
+        \ {'role': 'user',   'content': a:prompt},
+        \ ]
+
+  call s:RenderResultWithInput(a:title, a:prompt, 'Thinking...')
 
   let s:last_job = s:CallOpenAIChatAsync(
         \ a:prompt,
@@ -481,6 +532,72 @@ function! s:RunLLMRequest(title, prompt) abort
         \ )
 
   echo ''
+endfunction
+
+" Ask a follow-up question in the currently open result pane.
+function! LLMFollowUp(...) abort
+  try
+    if empty(s:llm_conv_api_msgs)
+      echohl WarningMsg
+      echom 'LLM: No active conversation. Use <leader>q or <leader>o first.'
+      echohl None
+      return
+    endif
+
+    let q = a:0 >= 1 ? a:1 : input('Follow-up: ')
+    if empty(q)
+      echohl WarningMsg | echom 'Canceled' | echohl None
+      return
+    endif
+
+    call add(s:llm_conv_api_msgs, {'role': 'user', 'content': q})
+    call add(s:llm_conv_follow_ups, {'q': q, 'a': 'Thinking...'})
+
+    call s:RenderStreamChunk(s:llm_conv_title, s:llm_conv_pane_input,
+          \ s:llm_conv_pane_out, s:llm_conv_follow_ups)
+    call s:ScrollToFollowUp(bufnr(g:llm_result_bufname), len(s:llm_conv_follow_ups))
+
+    let s:last_job = s:CallOpenAIChatAsyncMsgs(
+          \ deepcopy(s:llm_conv_api_msgs),
+          \ function('s:OnFollowUpDone'),
+          \ function('s:OnFollowUpChunk')
+          \ )
+
+    echo ''
+  catch
+    echohl ErrorMsg | echom v:exception | echohl None
+  endtry
+endfunction
+
+function! s:OnFollowUpChunk(accumulated) abort
+  if !empty(s:llm_conv_follow_ups)
+    let s:llm_conv_follow_ups[-1].a = a:accumulated
+  endif
+  let n = len(s:llm_conv_follow_ups)
+  call s:RenderStreamChunk(s:llm_conv_title, s:llm_conv_pane_input,
+        \ s:llm_conv_pane_out, s:llm_conv_follow_ups)
+  call s:ScrollToFollowUp(bufnr(g:llm_result_bufname), n)
+endfunction
+
+function! s:OnFollowUpDone(ok, text) abort
+  if a:ok
+    if !empty(s:llm_conv_follow_ups)
+      let s:llm_conv_follow_ups[-1].a = a:text
+    endif
+    call add(s:llm_conv_api_msgs, {'role': 'assistant', 'content': a:text})
+  else
+    if !empty(s:llm_conv_follow_ups)
+      let s:llm_conv_follow_ups[-1].a = "ERROR\n\n" . a:text
+    endif
+    " Remove the failed user message so the conversation stays consistent
+    if !empty(s:llm_conv_api_msgs) && s:llm_conv_api_msgs[-1].role ==# 'user'
+      call remove(s:llm_conv_api_msgs, -1)
+    endif
+  endif
+  let n = len(s:llm_conv_follow_ups)
+  call s:RenderResultWithInput(s:llm_conv_title, s:llm_conv_pane_input,
+        \ s:llm_conv_pane_out, s:llm_conv_follow_ups)
+  call s:ScrollToFollowUp(bufnr(g:llm_result_bufname), n)
 endfunction
 
 function! s:LogToFile(line) abort
@@ -539,6 +656,8 @@ function! LLMSelectModel() abort
 endfunction
 
 command! LLMSelectModel call LLMSelectModel()
+command! LLMFollowUp    call LLMFollowUp()
 
 xnoremap <silent> <leader>q :<C-u>call LLMAskFromVisual()<CR>
 xnoremap <silent> <leader>o :<C-u>call LLMFromVisual()<CR>
+nnoremap <silent> <leader>f :call LLMFollowUp()<CR>
