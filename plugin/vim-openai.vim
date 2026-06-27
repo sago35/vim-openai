@@ -53,8 +53,45 @@ endfunction
 " Function to handle the curl-out event.  It checks if a message is present
 " and, if so, appends it to the context's standard output.
 function! s:OnCurlOut(ctx, job, msg) abort
-  if a:msg isnot# ''
-    call add(a:ctx.stdout, a:msg)
+endfunction
+
+function! s:PollStreamFile(ctx, timer_id) abort
+  if !filereadable(a:ctx.resp)
+    return
+  endif
+
+  let all_lines = readfile(a:ctx.resp)
+  let new_lines = all_lines[a:ctx.file_lines_done :]
+  if empty(new_lines)
+    return
+  endif
+
+  let changed = 0
+  for line in new_lines
+    let a:ctx.file_lines_done += 1
+    if line !~# '^data:\s*'
+      continue
+    endif
+    let json_str = substitute(line, '^data:\s*', '', '')
+    if json_str ==# '[DONE]'
+      continue
+    endif
+    try
+      let chunk = json_decode(json_str)
+      if has_key(chunk, 'choices') && len(chunk.choices) > 0
+            \ && has_key(chunk.choices[0], 'delta')
+        let delta = chunk.choices[0].delta
+        if has_key(delta, 'content') && type(delta.content) == v:t_string
+          let a:ctx.accumulated .= delta.content
+          let changed = 1
+        endif
+      endif
+    catch
+    endtry
+  endfor
+
+  if changed && a:ctx.on_chunk isnot v:null
+    call call(a:ctx.on_chunk, [a:ctx.accumulated])
   endif
 endfunction
 
@@ -73,15 +110,14 @@ endfunction
 " finally calls a callback function with the result (success/failure and
 " content/error details).
 function! s:OnCurlExit(ctx, job, status) abort
-  if has_key(a:ctx, 'req_id')
-    call remove(s:running_jobs, a:ctx.req_id)
+  if has_key(a:ctx, 'timer')
+    call timer_stop(a:ctx.timer)
   endif
 
-  let err = join(a:ctx.stderr, "\n")
+  call s:PollStreamFile(a:ctx, -1)
 
-  let body = ''
-  if has_key(a:ctx, 'resp') && filereadable(a:ctx.resp)
-    let body = join(readfile(a:ctx.resp, 'b'), "\n")
+  if has_key(a:ctx, 'req_id')
+    call remove(s:running_jobs, a:ctx.req_id)
   endif
 
   if has_key(a:ctx, 'tmp_req') && filereadable(a:ctx.tmp_req)
@@ -91,76 +127,19 @@ function! s:OnCurlExit(ctx, job, status) abort
     call delete(a:ctx.resp)
   endif
 
+  let err = join(a:ctx.stderr, "\n")
+
   if a:status != 0
-    call s:DeferCall(a:ctx.on_done, [v:false, 'LLM request failed (exit=' . a:status . ")\n" . err . "\n" . body])
+    call s:DeferCall(a:ctx.on_done, [v:false, 'LLM request failed (exit=' . a:status . ")\n" . err])
     return
   endif
 
-  if empty(body)
-    call s:DeferCall(a:ctx.on_done, [v:false, "Empty response body.\n" . err])
+  if empty(a:ctx.accumulated)
+    call s:DeferCall(a:ctx.on_done, [v:false, "Empty response.\n" . err])
     return
   endif
 
-  try
-      let res = json_decode(body)
-  catch
-      let full_content = ''
-      let last_chunk = {}
-
-      let lines = split(body, "\n")
-      for line in lines
-          if line !~# '^data:\s*'
-              continue
-          endif
-
-          let json_str = substitute(line, '^data:\s*', '', '')
-
-          if json_str ==# '[DONE]'
-              break
-          endif
-
-          try
-              let chunk = json_decode(json_str)
-              let last_chunk = chunk
-
-              " choices[0].delta.content
-              if has_key(chunk, 'choices') && len(chunk.choices) > 0 && has_key(chunk.choices[0], 'delta')
-                  let delta = chunk.choices[0].delta
-                  if has_key(delta, 'content')
-                      let full_content .= delta.content
-                  endif
-              endif
-
-          catch
-              call s:DeferCall(a:ctx.on_done, [v:false, "Invalid JSON response:\n" . line])
-              return
-          endtry
-      endfor
-
-      let res = {
-                  \   'choices': [{
-                  \     'message': {
-                  \       'role': 'assistant',
-                  \       'content': full_content
-                  \     }
-                  \   }]
-                  \ }
-
-      if !empty(last_chunk)
-          let res.id = get(last_chunk, 'id', '')
-          let res.model = get(last_chunk, 'model', '')
-      endif
-  endtry
-
-  if type(res) == v:t_dict
-        \ && has_key(res, 'choices') && len(res.choices) > 0
-        \ && has_key(res.choices[0], 'message')
-        \ && has_key(res.choices[0].message, 'content')
-    call s:DeferCall(a:ctx.on_done, [v:true, res.choices[0].message.content])
-    return
-  endif
-
-  call s:DeferCall(a:ctx.on_done, [v:true, body])
+  call s:DeferCall(a:ctx.on_done, [v:true, a:ctx.accumulated])
 endfunction
 
 " Defers the execution of a function call by scheduling it to run after a short
@@ -173,14 +152,16 @@ endfunction
 " payload using predefined global variables (model, system prompt), writes it
 " to a temporary file, executes 'curl' to send the request, and manages the
 " execution job. It notifies the provided callback function upon completion."
-function! s:CallOpenAIChatAsync(userText, on_done) abort
+function! s:CallOpenAIChatAsync(userText, on_done, ...) abort
+  let On_chunk = a:0 >= 1 ? a:1 : v:null
+
   let payload = {
         \ 'model': g:llm_model,
         \ 'messages': [
         \   {'role': 'system', 'content': g:llm_system},
         \   {'role': 'user', 'content': a:userText},
         \ ],
-        \ 'stream': v:false
+        \ 'stream': v:true
         \ }
 
   let json = json_encode(payload)
@@ -188,12 +169,10 @@ function! s:CallOpenAIChatAsync(userText, on_done) abort
 
   let tmp_req = tempname()
   call writefile([json], tmp_req, 'b')
-
   let tmp_resp = tempname()
 
-  let cmd = ['curl', '-sS', '--fail']
+  let cmd = ['curl', '-sS', '--fail', '--no-buffer']
 
-  " トークンが設定されている場合のみ Authorization ヘッダーを追加
   if !empty(g:llm_auth_token)
     call extend(cmd, ['-H', 'Authorization: Bearer ' . g:llm_auth_token])
   endif
@@ -205,10 +184,11 @@ function! s:CallOpenAIChatAsync(userText, on_done) abort
         \ '--output', tmp_resp,
         \ ])
 
-  let ctx = {'stdout': [], 'stderr': [], 'tmp_req': tmp_req, 'resp': tmp_resp, 'on_done': a:on_done}
+  let ctx = {'stderr': [], 'tmp_req': tmp_req, 'resp': tmp_resp,
+        \    'on_done': a:on_done, 'on_chunk': On_chunk,
+        \    'accumulated': '', 'file_lines_done': 0}
 
   let opts = {
-        \ 'out_cb':  function('s:OnCurlOut',  [ctx]),
         \ 'err_cb':  function('s:OnCurlErr',  [ctx]),
         \ 'exit_cb': function('s:OnCurlExit', [ctx]),
         \ }
@@ -216,7 +196,8 @@ function! s:CallOpenAIChatAsync(userText, on_done) abort
   let job = job_start(cmd, opts)
 
   if type(job) != v:t_job
-    if filereadable(tmp_req) | call delete(tmp_req) | endif
+    if filereadable(tmp_req)  | call delete(tmp_req)  | endif
+    if filereadable(tmp_resp) | call delete(tmp_resp) | endif
     throw 'Failed to start job (curl)'
   endif
 
@@ -224,6 +205,8 @@ function! s:CallOpenAIChatAsync(userText, on_done) abort
   let ctx.req_id = s:req_seq
   let ctx.job = job
   let s:running_jobs[ctx.req_id] = ctx
+
+  let ctx.timer = timer_start(100, function('s:PollStreamFile', [ctx]), {'repeat': -1})
 
   return job
 endfunction
@@ -442,6 +425,41 @@ function! LLMAskFromVisual(...) range abort
   endtry
 endfunction
 
+function! s:RenderStreamChunk(title, input, output_text) abort
+  let bn = s:EnsureResultPane()
+
+  let inp = substitute(a:input, "\r\n", "\n", 'g')
+  let inp = substitute(inp, "\r", "\n", 'g')
+  let out = substitute(a:output_text, "\r\n", "\n", 'g')
+  let out = substitute(out, "\r", "\n", 'g')
+
+  let in_lines  = split(inp, "\n", 1)
+  let out_lines = split(out, "\n", 1)
+
+  let lines =
+        \ ['# ' . a:title,
+        \  '',
+        \  '## Input (folded)',
+        \  ''] + in_lines +
+        \ ['',
+        \  '## Output',
+        \  ''] + out_lines
+
+  call setbufvar(bn, '&modifiable', 1)
+  call setbufline(bn, 1, lines)
+
+  let new_last = len(lines)
+  let old_last = len(getbufline(bn, 1, '$'))
+  if old_last > new_last
+    call deletebufline(bn, new_last + 1, '$')
+  endif
+  call setbufvar(bn, '&modifiable', 0)
+endfunction
+
+function! s:OnLLMChunkWrapper(title, prompt, text) abort
+  call s:RenderStreamChunk(a:title, a:prompt, a:text)
+endfunction
+
 function! s:OnLLMDoneWrapper(title, prompt, ok, text) abort
   if a:ok
     call s:RenderResultWithInput(a:title, a:prompt, a:text)
@@ -455,7 +473,8 @@ function! s:RunLLMRequest(title, prompt) abort
 
   let s:last_job = s:CallOpenAIChatAsync(
         \ a:prompt,
-        \ function('s:OnLLMDoneWrapper', [a:title, a:prompt])
+        \ function('s:OnLLMDoneWrapper', [a:title, a:prompt]),
+        \ function('s:OnLLMChunkWrapper', [a:title, a:prompt])
         \ )
 
   echo ''
