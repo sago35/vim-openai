@@ -222,7 +222,7 @@ function! s:EnsureResultPane() abort
     setlocal filetype=markdown
     setlocal nomodifiable
     setlocal winfixwidth
-    execute 'vertical resize 60'
+    silent execute 'vertical resize 60'
 
     return bn
   endif
@@ -232,7 +232,7 @@ function! s:EnsureResultPane() abort
     execute 'silent keepalt keepjumps botright vsplit'
     execute 'buffer ' . bn
     setlocal winfixwidth
-    execute 'vertical resize 60'
+    silent execute 'vertical resize 60'
   endif
 
   return bn
@@ -426,7 +426,10 @@ function! LLMAskFromVisual(...) range abort
 endfunction
 
 function! s:RenderStreamChunk(title, input, output_text) abort
-  let bn = s:EnsureResultPane()
+  let bn = bufnr(g:llm_result_bufname)
+  if bn == -1
+    return
+  endif
 
   let inp = substitute(a:input, "\r\n", "\n", 'g')
   let inp = substitute(inp, "\r", "\n", 'g')
